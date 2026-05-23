@@ -5,15 +5,16 @@
 
 用法:
   xnode               交互式主菜单
-  xnode 2             直接切到序号 2
-  xnode -t            测当前节点延迟
-  xnode -T            测所有节点延迟
+  xnode 2             直接切到序号 2（从 1 开始）
+  xnode -t            测当前节点（TCPing + 真连接）
+  xnode -T            TCPing 所有节点（快速，不切换）
+  xnode -E            真连接测试所有节点（逐个切换，慢）
   xnode -u            更新订阅
   xnode -i            安装 xray
   xnode -s            查看服务状态
 """
 
-import base64, json, os, platform, re, shutil, subprocess, sys, time
+import base64, json, os, platform, re, shutil, socket, subprocess, sys, time
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from pathlib import Path
 XRAY_BIN = "/usr/local/bin/xray"
 XRAY_DIR = "/usr/local/etc/xray"
 CONFIG = f"{XRAY_DIR}/config.json"
+NODES_STATE = f"{XRAY_DIR}/nodes.json"  # 持久化节点序号
 GEOIP = "/usr/local/share/xray/geoip.dat"
 GEOSITE = "/usr/local/share/xray/geosite.dat"
 SYSTEMD_UNIT = "/etc/systemd/system/xray.service"
@@ -51,8 +53,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 def run_ok(cmd, **kw):
-    r = run(cmd, **kw)
-    return r.returncode == 0
+    return run(cmd, **kw).returncode == 0
 
 def xray_installed():
     return os.path.isfile(XRAY_BIN) and os.access(XRAY_BIN, os.X_OK)
@@ -73,15 +74,85 @@ def save_cfg(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG)
 
+# ── 持久化节点序号 ──
+
+def load_node_order():
+    """从 nodes.json 读取持久化的节点 tag 顺序列表"""
+    if os.path.isfile(NODES_STATE):
+        try:
+            with open(NODES_STATE) as f:
+                data = json.load(f)
+                return data.get("order", [])
+        except Exception:
+            pass
+    return None
+
+def save_node_order(order):
+    """写入持久化节点顺序"""
+    os.makedirs(os.path.dirname(NODES_STATE), exist_ok=True)
+    tmp = NODES_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"order": order}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NODES_STATE)
+
 def get_nodes(cfg=None):
-    """从 config 提取代理节点列表（排除 direct/block），按 tag 排序保证序号固定"""
+    """返回按持久化顺序排列的代理节点列表，序号从 1 开始。
+    已有节点保持原顺序，新节点追加到末尾，消失的节点从顺序中移除。"""
     cfg = cfg or load_cfg()
     if not cfg:
         return []
-    nodes = [o for o in cfg.get("outbounds", []) if o["tag"] not in ("direct", "block")]
-    # 按 tag 排序 — 序号固定不受切换影响
-    nodes.sort(key=lambda o: o["tag"])
-    return nodes
+    # 从 config 提取所有代理节点
+    all_tags = {o["tag"]: o for o in cfg.get("outbounds", [])
+                if o["tag"] not in ("direct", "block")}
+
+    if not all_tags:
+        return []
+
+    # 加载持久化顺序
+    saved_order = load_node_order()
+
+    if saved_order is None:
+        # 首次：按 tag 排序初始化
+        saved_order = sorted(all_tags.keys())
+        save_node_order(saved_order)
+
+    # 构建最终顺序：保留已有顺序，追加新节点，移除消失的
+    result = []
+    seen = set()
+    for tag in saved_order:
+        if tag in all_tags and tag not in seen:
+            result.append(all_tags[tag])
+            seen.add(tag)
+    # 追加新节点（config 有但 order 里没有的）
+    for tag in sorted(all_tags.keys()):
+        if tag not in seen:
+            result.append(all_tags[tag])
+            seen.add(tag)
+
+    # 如果顺序有变化，更新持久化文件
+    new_order = [o["tag"] for o in result]
+    if new_order != saved_order:
+        save_node_order(new_order)
+
+    return result
+
+def refresh_node_order_after_sub(new_tags):
+    """订阅更新后合并新节点到持久化顺序：旧的保留位置，新的追加到末尾"""
+    saved_order = load_node_order()
+    if saved_order is None:
+        save_node_order(sorted(new_tags))
+        return
+
+    # 已有顺序里只保留还存在的
+    existing = set(new_tags)
+    updated = [t for t in saved_order if t in existing]
+    # 追加新节点
+    seen = set(updated)
+    for t in sorted(new_tags):
+        if t not in seen:
+            updated.append(t)
+            seen.add(t)
+    save_node_order(updated)
 
 def current_tag(cfg=None):
     cfg = cfg or load_cfg()
@@ -101,7 +172,31 @@ def node_info(ob):
         addr = ob["settings"]["servers"][0]["address"]
     return proto, addr
 
+def node_addr(ob):
+    """从 outbound 提取 (host, port)"""
+    if "vnext" in ob["settings"]:
+        v = ob["settings"]["vnext"][0]
+        return v["address"], v["port"]
+    if "servers" in ob["settings"]:
+        s = ob["settings"]["servers"][0]
+        return s["address"], s["port"]
+    return None, None
+
+def tcping(host, port, timeout=5):
+    """TCP 握手测延迟，不经过代理、不重启 xray"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        start = time.time()
+        s.connect((host, int(port)))
+        lat = time.time() - start
+        s.close()
+        return lat
+    except Exception:
+        return None
+
 def curl_once():
+    """经代理 curl 测端到端延迟（仅测当前节点用）"""
     try:
         r = run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
                  "-o", "/dev/null", "-w", "%{time_total}",
@@ -109,13 +204,11 @@ def curl_once():
                  f"https://www.google.com/?_={int(time.time()*1000)}"],
                 timeout=15)
         s = r.stdout.strip()
-        # curl 非 0 = 请求失败（连接拒绝/超时等），0.000s 不是真延迟
         if r.returncode != 0:
             return None
         lat = float(s) if s else None
-        # 0.000s 不可能是真延迟（Google 不可能 0ms 响应），视为连接复用假阳性
+        # 0.000s 不是真延迟，重试
         if lat is not None and lat < 0.01:
-            # 重试一次，强制新建连接
             time.sleep(0.3)
             r2 = run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
                       "-o", "/dev/null", "-w", "%{time_total}",
@@ -140,7 +233,6 @@ def fmt_lat(v):
     return f"{RED}{v:.1f}s ⚠️{R}"
 
 def restart_xray():
-    # 先清除可能的限流状态
     run(["systemctl", "reset-failed", SERVICE])
     r = run(["systemctl", "restart", SERVICE])
     if r.returncode != 0:
@@ -178,7 +270,6 @@ def set_sub_url(url):
             break
     if not found:
         lines.append(f'XRAY_SUB_URL="{url}"\n')
-    # 确保 其他必要变量
     has_socks = any(l.startswith("XRAY_SOCKS_PORT=") for l in lines)
     has_http = any(l.startswith("XRAY_HTTP_PORT=") for l in lines)
     has_config = any(l.startswith("XRAY_CONFIG=") for l in lines)
@@ -237,13 +328,11 @@ def install_xray():
         if a != "y":
             return
 
-    # 检测架构
     arch = platform.machine().lower()
     arch_map = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm32"}
     go_arch = arch_map.get(arch, arch)
     print(f"  架构: {arch} → {go_arch}")
 
-    # 获取最新版本
     print("  获取最新版本...")
     r = run(["curl", "-sf", "https://api.github.com/repos/XTLS/Xray-core/releases/latest"])
     if r.returncode != 0:
@@ -258,7 +347,6 @@ def install_xray():
         return
     print(f"  最新版本: {version}")
 
-    # 找下载 URL
     dl_name = f"Xray-{version[1:]}-linux-{go_arch}.zip"
     dl_url = None
     for a in assets:
@@ -266,8 +354,6 @@ def install_xray():
             dl_url = a["browser_download_url"]
             break
     if not dl_url:
-        # 尝试不带 v 前缀
-        dl_name2 = f"Xray-linux-{go_arch}.zip"
         for a in assets:
             if a["name"].endswith(f"linux-{go_arch}.zip"):
                 dl_url = a["browser_download_url"]
@@ -276,7 +362,6 @@ def install_xray():
         print(f"  {RED}❌ 找不到 {dl_name}{R}")
         return
 
-    # 下载
     tmpdir = "/tmp/xray-install"
     shutil.rmtree(tmpdir, ignore_errors=True)
     os.makedirs(tmpdir, exist_ok=True)
@@ -288,19 +373,16 @@ def install_xray():
         print(f"  {RED}❌ 下载失败{R}")
         return
 
-    # 解压
     print("  解压...")
     r = run(["unzip", "-o", zipfile, "-d", tmpdir])
     if r.returncode != 0:
         print(f"  {RED}❌ 解压失败{R}")
         return
 
-    # 安装文件
     print("  安装文件...")
     os.makedirs(XRAY_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(GEOIP), exist_ok=True)
 
-    # 找 xray 二进制
     xray_src = f"{tmpdir}/xray"
     if not os.path.isfile(xray_src):
         print(f"  {RED}❌ 找不到 xray 二进制{R}")
@@ -308,13 +390,11 @@ def install_xray():
     shutil.copy2(xray_src, XRAY_BIN)
     os.chmod(XRAY_BIN, 0o755)
 
-    # geo 文件
     for name, dst in [("geoip.dat", GEOIP), ("geosite.dat", GEOSITE)]:
         src = f"{tmpdir}/{name}"
         if os.path.isfile(src):
             shutil.copy2(src, dst)
 
-    # 写 systemd unit
     print("  写 systemd 服务...")
     with open(SYSTEMD_UNIT, "w") as f:
         f.write(f"""[Unit]
@@ -336,11 +416,9 @@ WantedBy=multi-user.target
 
     run(["systemctl", "daemon-reload"])
 
-    # 写默认配置（直通模式，SOCKS5+HTTP 端口立即可用）
     if not os.path.isfile(CONFIG):
         write_default_config()
 
-    # 验证
     v = run([XRAY_BIN, "version"])
     first = v.stdout.split("\n")[0] if v.stdout else "?"
     print(f"\n  {GREEN}✅ 安装完成: {first}{R}")
@@ -348,7 +426,6 @@ WantedBy=multi-user.target
 
     shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # 启动
     a = input(f"\n  {CYAN}启动 xray? [Y/n]{R} ").strip().lower()
     if a != "n":
         run(["systemctl", "enable", "--now", SERVICE])
@@ -364,7 +441,6 @@ def manage_sub():
 
     url = get_sub_url()
     if url:
-        # 隐藏 URL 中间
         display = url[:40] + "..." + url[-20:] if len(url) > 60 else url
         print(f"  当前订阅: {display}")
     else:
@@ -398,7 +474,7 @@ def manage_sub():
             print(f"  无订阅配置")
 
 def sync_sub():
-    """拉取订阅、解析、生成 config、重启 xray"""
+    """拉取订阅、解析、生成 config、合并节点序号、重启 xray"""
     url = get_sub_url()
     if not url:
         print(f"  {RED}❌ 未配置订阅 URL{R}")
@@ -406,21 +482,18 @@ def sync_sub():
 
     print(f"  📥 拉取订阅...")
 
-    # 用代理拉取（如果 xray 正在运行）
-    proxy = ""
+    proxy_args = []
     if service_active():
-        proxy = f" --proxy socks5://127.0.0.1:{SOCKS_PORT}"
+        proxy_args = ["--proxy", f"socks5://127.0.0.1:{SOCKS_PORT}"]
 
     r = run(["curl", "-sf", "--connect-timeout", "15", "--max-time", "60"] +
-            (["--proxy", f"socks5://127.0.0.1:{SOCKS_PORT}"] if proxy else []) +
-            [url], timeout=90)
+            proxy_args + [url], timeout=90)
     if r.returncode != 0 or not r.stdout.strip():
         print(f"  {RED}❌ 拉取失败{R}")
         return False
 
     raw = r.stdout.strip()
 
-    # 解码
     try:
         decoded = base64.b64decode(raw + "==").decode("utf-8")
         links = [l.strip() for l in decoded.split("\n") if l.strip()]
@@ -429,12 +502,13 @@ def sync_sub():
 
     print(f"  解码 {len(links)} 条链接")
 
-    # 解析
     outbounds = []
+    new_tags = []
     for link in links:
         ob = parse_vless(link) or parse_vmess(link) or parse_ss(link)
         if ob:
             outbounds.append(ob)
+            new_tags.append(ob["tag"])
             print(f"    {GREEN}✅{R} {ob['tag']} ({ob['protocol']})")
         else:
             proto = link.split("://")[0] if "://" in link else "?"
@@ -444,26 +518,69 @@ def sync_sub():
         print(f"  {RED}❌ 没有可用节点{R}")
         return False
 
-    # 生成 config
+    # 合并节点序号：旧的保留位置，新的追加
+    refresh_node_order_after_sub(new_tags)
+
+    # 恢复用户选择的默认出站
+    saved_order = load_node_order() or []
+    # 找当前默认（用户上次选的）
+    old_cfg = load_cfg()
+    old_default = current_tag(old_cfg) if old_cfg else None
+
+    # 按持久化顺序排 outbounds，保证用户默认出站排第一
     config = generate_config(outbounds)
+
+    # 重新排序 outbounds：默认出站第一，其余按持久化序号
+    order_map = {tag: i for i, tag in enumerate(saved_order)}
+    proxy_outbounds = [o for o in config["outbounds"]
+                       if o["tag"] not in ("direct", "block")]
+    rest = [o for o in config["outbounds"]
+            if o["tag"] in ("direct", "block")]
+
+    # 默认出站放第一位
+    default_node = None
+    sorted_proxies = []
+    if old_default and any(o["tag"] == old_default for o in proxy_outbounds):
+        for o in proxy_outbounds:
+            if o["tag"] == old_default:
+                default_node = o
+            else:
+                sorted_proxies.append(o)
+    else:
+        # 旧默认不在新节点里，取持久化顺序第一个
+        if proxy_outbounds:
+            sorted_proxies = proxy_outbounds[1:]
+            default_node = proxy_outbounds[0]
+
+    config["outbounds"] = ([default_node] + sorted_proxies + rest
+                           if default_node else sorted_proxies + rest)
 
     # 写入
     tmp = CONFIG + ".sync"
     with open(tmp, "w") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    # 验证
     r = run([XRAY_BIN, "run", "-test", "-format", "json", "-config", tmp])
     if r.returncode != 0:
         print(f"  {RED}❌ 配置验证失败{R}")
         os.remove(tmp)
         return False
 
-    # 原子替换
     os.replace(tmp, CONFIG)
-    print(f"  {GREEN}✅ 配置已更新 ({len(outbounds)} 个节点){R}")
 
-    # 重启
+    # 统计变化
+    old_tags = set(o["tag"] for o in (old_cfg or {}).get("outbounds", [])
+                   if o["tag"] not in ("direct", "block"))
+    new_tag_set = set(new_tags)
+    added = new_tag_set - old_tags
+    removed = old_tags - new_tag_set
+
+    print(f"  {GREEN}✅ 配置已更新 ({len(outbounds)} 个节点){R}")
+    if added:
+        print(f"  {CYAN}  新增: {', '.join(sorted(added))}{R}")
+    if removed:
+        print(f"  {YELLOW}  移除: {', '.join(sorted(removed))}{R}")
+
     restart_xray()
     print(f"  {GREEN}✅ xray 已重启{R}")
     return True
@@ -582,16 +699,18 @@ def generate_config(outbounds):
 # ── 节点切换 ──
 
 def do_switch(idx, nodes):
-    if idx < 0 or idx >= len(nodes):
-        print(f"  {RED}❌ 序号 {idx} 越界{R}")
+    """idx 从 1 开始"""
+    real_idx = idx - 1
+    if real_idx < 0 or real_idx >= len(nodes):
+        print(f"  {RED}❌ 序号 {idx} 越界，范围 1-{len(nodes)}{R}")
         return
-    target = nodes[idx]["tag"]
+    target = nodes[real_idx]["tag"]
     cfg = load_cfg()
     cur = current_tag(cfg)
     if target == cur:
         print(f"  当前已是 {target}")
         return
-    new_out = [nodes[idx]] + [o for o in cfg["outbounds"] if o["tag"] != target]
+    new_out = [nodes[real_idx]] + [o for o in cfg["outbounds"] if o["tag"] != target]
     cfg["outbounds"] = new_out
     save_cfg(cfg)
     print(f"  🔀 {cur} → {target}")
@@ -600,7 +719,33 @@ def do_switch(idx, nodes):
 
 # ── 延迟测试 ──
 
-def test_current():
+def test_current_tcping():
+    """TCPing 当前节点"""
+    cfg = load_cfg()
+    cur = current_tag(cfg)
+    if not cur:
+        print(f"  {RED}❌ 无可用节点{R}")
+        return
+    nodes = get_nodes(cfg)
+    cur_node = None
+    for n in nodes:
+        if n["tag"] == cur:
+            cur_node = n
+            break
+    print(f"  当前: {cur}")
+    if cur_node:
+        host, port = node_addr(cur_node)
+        if host:
+            for i in range(3):
+                lat = tcping(host, port)
+                print(f"  #{i+1} {fmt_lat(lat)}")
+                time.sleep(0.3)
+
+def test_current_curl():
+    """真连接测试当前节点（经代理 curl）"""
+    if not service_active():
+        print(f"  {RED}❌ xray 未运行{R}")
+        return
     cur = current_tag()
     if not cur:
         print(f"  {RED}❌ 无可用节点{R}")
@@ -612,16 +757,60 @@ def test_current():
         time.sleep(0.5)
 
 def test_all():
+    """TCPing 所有节点，不需要切换/重启 xray"""
     cfg = load_cfg()
     if not cfg:
         print(f"  {RED}❌ 无配置{R}")
         return {}
     nodes = get_nodes(cfg)
+    if not nodes:
+        print(f"  {RED}❌ 无节点{R}")
+        return {}
+    cur = current_tag(cfg)
+    latencies = {}
+
+    print(f"  测试 {len(nodes)} 个节点（TCPing）...\n")
+    for i, node in enumerate(nodes):
+        num = i + 1
+        tag = node["tag"]
+        host, port = node_addr(node)
+        if not host:
+            latencies[num] = None
+            print(f"  {B}{num}{R}  {tag}  {RED}❌ 无地址{R}")
+            continue
+        lats = [tcping(host, port) for _ in range(3)]
+        valid = [l for l in lats if l is not None]
+        avg = sum(valid) / len(valid) if valid else None
+        latencies[num] = avg
+        proto, addr = node_info(node)
+        marker = f" {GREEN}👈{R}" if tag == cur else ""
+        print(f"  {B}{num}{R}  {tag}  ({proto} {addr})  {fmt_lat(avg)}{marker}")
+        time.sleep(0.2)
+
+    best_num = min(latencies, key=lambda k: latencies[k] if latencies[k] is not None else 999)
+    if latencies[best_num] is not None and latencies[best_num] < 999:
+        print(f"\n  🏆 最快: {nodes[best_num-1]['tag']}  {fmt_lat(latencies[best_num])}")
+    return latencies
+
+def test_all_curl():
+    """真连接测试所有节点：逐个切换 + curl 端到端，慢但反映真实代理性能"""
+    if not service_active():
+        print(f"  {RED}❌ xray 未运行，无法真连接测试{R}")
+        return {}
+    cfg = load_cfg()
+    if not cfg:
+        print(f"  {RED}❌ 无配置{R}")
+        return {}
+    nodes = get_nodes(cfg)
+    if not nodes:
+        print(f"  {RED}❌ 无节点{R}")
+        return {}
     orig = current_tag(cfg)
     latencies = {}
 
-    print(f"  测试 {len(nodes)} 个节点...\n")
+    print(f"  测试 {len(nodes)} 个节点（真连接，逐个切换）...\n")
     for i, node in enumerate(nodes):
+        num = i + 1
         tag = node["tag"]
         if tag != current_tag():
             new_out = [node] + [o for o in load_cfg()["outbounds"] if o["tag"] != tag]
@@ -629,29 +818,28 @@ def test_all():
             cfg2["outbounds"] = new_out
             save_cfg(cfg2)
             restart_xray()
-            # 等 xray 稳定，避免 systemd 限流
             time.sleep(1)
         lats = [curl_once() for _ in range(3)]
         valid = [l for l in lats if l is not None]
         avg = sum(valid) / len(valid) if valid else None
-        latencies[i] = avg
+        latencies[num] = avg
         proto, addr = node_info(node)
         marker = f" {GREEN}👈{R}" if tag == orig else ""
-        print(f"  {i}  {tag}  ({proto} {addr})  {fmt_lat(avg)}{marker}")
+        print(f"  {B}{num}{R}  {tag}  ({proto} {addr})  {fmt_lat(avg)}{marker}")
 
-    # 切回
+    # 切回原始节点
     if orig != current_tag():
         cfg2 = load_cfg()
-        new_out = [o for o in cfg2["outbounds"] if o["tag"] == orig]
-        new_out += [o for o in cfg2["outbounds"] if o["tag"] != orig]
-        cfg2["outbounds"] = new_out
+        orig_node = [o for o in cfg2["outbounds"] if o["tag"] == orig]
+        rest = [o for o in cfg2["outbounds"] if o["tag"] != orig]
+        cfg2["outbounds"] = orig_node + rest
         save_cfg(cfg2)
         restart_xray()
         print(f"\n  已切回 {orig}")
 
-    best_i = min(latencies, key=lambda k: latencies[k] if latencies[k] else 999)
-    if latencies[best_i] and latencies[best_i] < 999:
-        print(f"\n  🏆 最快: {nodes[best_i]['tag']}  {fmt_lat(latencies[best_i])}")
+    best_num = min(latencies, key=lambda k: latencies[k] if latencies[k] is not None else 999)
+    if latencies[best_num] is not None and latencies[best_num] < 999:
+        print(f"\n  🏆 最快: {nodes[best_num-1]['tag']}  {fmt_lat(latencies[best_num])}")
     return latencies
 
 # ── 服务状态 ──
@@ -672,12 +860,10 @@ def show_status():
     print(f"  状态:  {'🟢 运行中' if active else '🔴 未运行'}")
 
     if active:
-        # PID
         r = run(["systemctl", "show", SERVICE, "--property=MainPID"])
         pid = r.stdout.strip().split("=")[-1] if r.returncode == 0 else "?"
         print(f"  PID:   {pid}")
 
-        # 内存
         r = run(["systemctl", "show", SERVICE, "--property=MemoryCurrent"])
         mem = r.stdout.strip().split("=")[-1] if r.returncode == 0 else "?"
         try:
@@ -686,17 +872,14 @@ def show_status():
         except Exception:
             pass
 
-        # 运行时间
         r = run(["systemctl", "show", SERVICE, "--property=ActiveEnterTimestamp"])
         ts = r.stdout.strip().split("=", 1)[-1] if r.returncode == 0 else ""
         if ts:
             print(f"  启动于: {ts}")
 
-    # 端口
     print(f"\n  SOCKS5: 127.0.0.1:{SOCKS_PORT}")
     print(f"  HTTP:   127.0.0.1:{HTTP_PORT}")
 
-    # 节点
     cfg = load_cfg()
     if cfg:
         cur = current_tag(cfg)
@@ -704,12 +887,10 @@ def show_status():
         print(f"\n  当前节点: {cur}")
         print(f"  节点数:   {len(nodes)}")
 
-    # 订阅
     url = get_sub_url()
     if url:
         print(f"\n  订阅:   {url[:50]}{'...' if len(url)>50 else ''}")
 
-    # 最近日志
     if active:
         print(f"\n  {DIM}--- 最近日志 ---{R}")
         r = run(["journalctl", "-u", SERVICE, "-n", "5", "--no-pager"])
@@ -725,44 +906,68 @@ def draw_main_menu():
   ║            xnode — xray 管理工具         ║
   ╚══════════════════════════════════════════╝{R}""")
 
-    # 安装状态
     if not xray_installed():
         print(f"\n  {RED}⚠️ xray 未安装{R}")
-        print(f"\n  {B}i{R}  安装 xray")
-        print(f"\n  {B}q{R}  退出")
-        return
+        print(f"\n  {B}1{R}  安装 xray")
+        print(f"\n  {B}0{R}  退出")
+        return 1
 
-    # 服务状态
     active = service_active()
     status = f"{GREEN}🟢 运行中{R}" if active else f"{RED}🔴 未运行{R}"
     cur = current_tag() or "无"
     print(f"\n  状态: {status}    当前: {cur}")
 
-    # 节点列表
     cfg = load_cfg()
     nodes = get_nodes(cfg) if cfg else []
+    menu_offset = 0
     if nodes:
         print(f"\n  {B}── 节点 ──{R}")
         for i, node in enumerate(nodes):
+            num = i + 1
             proto, addr = node_info(node)
             marker = f" {GREEN}👈{R}" if node["tag"] == current_tag(cfg) else ""
-            print(f"  {B}{i}{R}  {node['tag']}  ({proto} {addr}){marker}")
+            print(f"  {B}{num}{R}  {node['tag']}  ({proto} {addr}){marker}")
+        menu_offset = len(nodes)
 
-    # 操作
+    test_ping = menu_offset + 1
+    test_curl = menu_offset + 2
+    act_sub = menu_offset + 3
+    act_manage = menu_offset + 4
+    act_status = menu_offset + 5
+    act_restart = menu_offset + 6
+    act_install = menu_offset + 7
+
     print(f"""
+  {B}── 测试 ──{R}
+  {B}{test_ping}{R}  TCPing 测试
+  {B}{test_curl}{R}  真连接测试
   {B}── 操作 ──{R}
-  {B}t{R}  测试当前节点延迟
-  {B}T{R}  测试所有节点延迟
-  {B}u{R}  更新订阅
-  {B}s{R}  订阅管理（添加/修改/删除）
-  {B}S{R}  服务状态
-  {B}r{R}  重启 xray
-  {B}i{R}  重装 xray
-  {B}q{R}  退出""")
+  {B}{act_sub}{R}  更新订阅
+  {B}{act_manage}{R}  订阅管理（添加/修改/删除）
+  {B}{act_status}{R}  服务状态
+  {B}{act_restart}{R}  重启 xray
+  {B}{act_install}{R}  重装 xray
+  {B}0{R}  退出""")
+
+    return menu_offset
+
+def prompt_scope():
+    """选测试后问：当前/所有"""
+    print(f"\n  {B}1{R}  当前节点    {B}2{R}  所有节点")
+    try:
+        c = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if c == "1":
+        return "current"
+    elif c == "2":
+        return "all"
+    return None
 
 def interactive():
     while True:
-        draw_main_menu()
+        menu_offset = draw_main_menu()
         try:
             choice = input("\n  > ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -771,55 +976,86 @@ def interactive():
 
         if not choice:
             continue
-        if choice in ("q", "Q", "exit"):
+
+        # 0 = 退出
+        if choice == "0":
             break
+
+        # 统一数字解析
+        try:
+            num = int(choice)
+        except ValueError:
+            print(f"  {RED}❌ 请输入数字{R}")
+            time.sleep(1)
+            continue
+
+        if not xray_installed():
+            if num == 1:
+                install_xray()
+                input("\n  回车继续...")
+            continue
 
         cfg = load_cfg()
         nodes = get_nodes(cfg) if cfg else []
+        node_count = len(nodes)
 
-        # 数字 → 切换节点
-        try:
-            idx = int(choice)
-            if 0 <= idx < len(nodes):
-                do_switch(idx, nodes)
-                input("\n  回车继续...")
+        # 1~node_count → 切换节点
+        if 1 <= num <= node_count:
+            do_switch(num, nodes)
+            input("\n  回车继续...")
             continue
-        except ValueError:
-            pass
 
-        if choice == "t":
-            test_current()
+        test_ping = node_count + 1
+        test_curl = node_count + 2
+        act_sub = node_count + 3
+        act_manage = node_count + 4
+        act_status = node_count + 5
+        act_restart = node_count + 6
+        act_install = node_count + 7
+
+        if num == test_ping:
+            scope = prompt_scope()
+            if scope == "current":
+                test_current_tcping()
+            elif scope == "all":
+                test_all()
             input("\n  回车继续...")
-        elif choice == "T":
-            test_all()
+        elif num == test_curl:
+            scope = prompt_scope()
+            if scope == "current":
+                test_current_curl()
+            elif scope == "all":
+                test_all_curl()
             input("\n  回车继续...")
-        elif choice == "u":
+        elif num == act_sub:
             sync_sub()
             input("\n  回车继续...")
-        elif choice == "s":
+        elif num == act_manage:
             manage_sub()
             input("\n  回车继续...")
-        elif choice == "S":
+        elif num == act_status:
             show_status()
             input("\n  回车继续...")
-        elif choice == "r":
+        elif num == act_restart:
             print("  重启 xray...")
             restart_xray()
             print(f"  {GREEN}✅ 已重启{R}")
             input("\n  回车继续...")
-        elif choice in ("i", "I"):
+        elif num == act_install:
             install_xray()
             input("\n  回车继续...")
 
 # ── 非交互模式 ──
 
-def direct_switch(idx):
+def direct_switch(num):
+    """num 从 1 开始"""
     cfg = load_cfg()
     nodes = get_nodes(cfg)
+    idx = num - 1
     if idx < 0 or idx >= len(nodes):
-        print(f"❌ 序号 {idx} 越界，范围 0-{len(nodes)-1}")
+        print(f"❌ 序号 {num} 越界，范围 1-{len(nodes)}")
         sys.exit(1)
-    do_switch(idx, nodes)
+    do_switch(num, nodes)
     for i in range(3):
         lat = curl_once()
         print(f"  #{i+1} {fmt_lat(lat)}")
@@ -834,22 +1070,26 @@ def main():
         if sys.stdin.isatty():
             interactive()
         else:
-            # 非 TTY：列出节点
             cur = current_tag()
             print(f"当前: {cur}")
             cfg = load_cfg()
             nodes = get_nodes(cfg)
             for i, node in enumerate(nodes):
+                num = i + 1
                 proto, addr = node_info(node)
                 marker = " 👈" if node["tag"] == cur else ""
-                print(f"  {i}  {node['tag']}  ({proto} {addr}){marker}")
+                print(f"  {num}  {node['tag']}  ({proto} {addr}){marker}")
         return
 
     a = args[0]
     if a == "-t":
-        test_current()
+        test_current_tcping()
+        print()
+        test_current_curl()
     elif a == "-T":
         test_all()
+    elif a == "-E":
+        test_all_curl()
     elif a == "-u":
         sync_sub()
     elif a == "-i":
@@ -858,10 +1098,10 @@ def main():
         show_status()
     else:
         try:
-            idx = int(a)
-            direct_switch(idx)
+            num = int(a)
+            direct_switch(num)
         except ValueError:
-            print(f"❌ 输入数字序号或 -t/-T/-u/-i/-s")
+            print(f"❌ 输入数字序号（从 1 开始）或 -t/-T/-E/-u/-i/-s")
             sys.exit(1)
 
 if __name__ == "__main__":
