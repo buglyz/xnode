@@ -2,6 +2,8 @@
 
 xray-core 的完整管理 CLI：从安装到日常使用，一个脚本搞定。
 
+[English](README_EN.md)
+
 ## 功能
 
 | 功能 | 说明 |
