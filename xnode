@@ -74,11 +74,14 @@ def save_cfg(cfg):
     os.replace(tmp, CONFIG)
 
 def get_nodes(cfg=None):
-    """从 config 提取代理节点列表（排除 direct/block）"""
+    """从 config 提取代理节点列表（排除 direct/block），按 tag 排序保证序号固定"""
     cfg = cfg or load_cfg()
     if not cfg:
         return []
-    return [o for o in cfg.get("outbounds", []) if o["tag"] not in ("direct", "block")]
+    nodes = [o for o in cfg.get("outbounds", []) if o["tag"] not in ("direct", "block")]
+    # 按 tag 排序 — 序号固定不受切换影响
+    nodes.sort(key=lambda o: o["tag"])
+    return nodes
 
 def current_tag(cfg=None):
     cfg = cfg or load_cfg()
@@ -106,7 +109,24 @@ def curl_once():
                  f"https://www.google.com/?_={int(time.time()*1000)}"],
                 timeout=15)
         s = r.stdout.strip()
-        return float(s) if s else None
+        # curl 非 0 = 请求失败（连接拒绝/超时等），0.000s 不是真延迟
+        if r.returncode != 0:
+            return None
+        lat = float(s) if s else None
+        # 0.000s 不可能是真延迟（Google 不可能 0ms 响应），视为连接复用假阳性
+        if lat is not None and lat < 0.01:
+            # 重试一次，强制新建连接
+            time.sleep(0.3)
+            r2 = run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
+                      "-o", "/dev/null", "-w", "%{time_total}",
+                      "--max-time", "10", "-H", "Connection: close",
+                      f"https://www.google.com/?_={int(time.time()*1000)}"],
+                     timeout=15)
+            s2 = r2.stdout.strip()
+            if r2.returncode != 0:
+                return None
+            lat = float(s2) if s2 else None
+        return lat
     except Exception:
         return None
 
@@ -120,6 +140,8 @@ def fmt_lat(v):
     return f"{RED}{v:.1f}s ⚠️{R}"
 
 def restart_xray():
+    # 先清除可能的限流状态
+    run(["systemctl", "reset-failed", SERVICE])
     r = run(["systemctl", "restart", SERVICE])
     if r.returncode != 0:
         print(f"  {RED}❌ restart 失败: {r.stderr.strip()}{R}")
@@ -607,6 +629,8 @@ def test_all():
             cfg2["outbounds"] = new_out
             save_cfg(cfg2)
             restart_xray()
+            # 等 xray 稳定，避免 systemd 限流
+            time.sleep(1)
         lats = [curl_once() for _ in range(3)]
         valid = [l for l in lats if l is not None]
         avg = sum(valid) / len(valid) if valid else None
