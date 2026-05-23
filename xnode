@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""xnode — xray 节点切换 CLI
+
+交互式菜单，输入序号切换，q 退出。
+
+用法:
+  xnode           交互式菜单
+  xnode 2         直接切到序号 2
+  xnode -t        测当前节点延迟
+  xnode -T        测所有节点延迟
+  xnode -u        更新订阅
+"""
+
+import json, sys, subprocess, time, os, signal
+
+CONFIG = "/usr/local/etc/xray/config.json"
+SYSTEMD = "xray"
+SUB_SCRIPT = "/usr/local/bin/xray-sub-sync"
+SUB_ENV = "/etc/xray-sub-sync.env"
+
+NODES = [
+    "🇯🇵 VLESS-Tokyo",
+    "🇭🇰 VLESS-HK",
+    "🇯🇵 SS-Tokyo",
+    "🇺🇸 VLESS-US",
+    "🇬🇧 VLESS-London",
+]
+
+# ── 工具函数 ──
+
+def load():
+    with open(CONFIG) as f:
+        return json.load(f)
+
+def save(cfg):
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG)
+
+def restart_xray():
+    r = subprocess.run(["systemctl", "restart", SYSTEMD], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"❌ restart 失败: {r.stderr.strip()}")
+        return False
+    for _ in range(10):
+        try:
+            subprocess.run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
+                           "-o", "/dev/null", "--max-time", "3",
+                           f"https://www.google.com/?_={int(time.time()*1000)}"],
+                          capture_output=True, timeout=5)
+            return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+def current_tag(cfg=None):
+    cfg = cfg or load()
+    for o in cfg["outbounds"]:
+        if o["tag"] in NODES:
+            return o["tag"]
+    return None
+
+def get_node_info(cfg, tag):
+    for o in cfg["outbounds"]:
+        if o["tag"] == tag:
+            proto = o["protocol"].upper()
+            addr = ""
+            if "vnext" in o["settings"]:
+                addr = o["settings"]["vnext"][0]["address"]
+            elif "servers" in o["settings"]:
+                addr = o["settings"]["servers"][0]["address"]
+            return proto, addr
+    return "?", "?"
+
+def curl_once():
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
+             "-o", "/dev/null", "-w", "%{time_total}",
+             "--max-time", "10", f"https://www.google.com/?_={int(time.time()*1000)}"],
+            capture_output=True, text=True, timeout=15)
+        s = r.stdout.strip()
+        return float(s) if s else None
+    except Exception:
+        return None
+
+def fmt_lat(v):
+    if v is None:
+        return "❌ 超时"
+    if v < 1:
+        return f"{v:.3f}s"
+    if v < 3:
+        return f"{v:.2f}s"
+    return f"{v:.1f}s ⚠️"
+
+# ── 交互式菜单 ──
+
+def clear():
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+def draw_menu(latencies=None):
+    cfg = load()
+    cur = current_tag(cfg)
+    clear()
+    print("╔══════════════════════════════════════════╗")
+    print("║          xnode — xray 节点切换           ║")
+    print("╠══════════════════════════════════════════╣")
+    for i, tag in enumerate(NODES):
+        proto, addr = get_node_info(cfg, tag)
+        marker = " 👈" if tag == cur else "   "
+        lat_str = ""
+        if latencies and i in latencies:
+            lat_str = f"  {fmt_lat(latencies[i])}"
+        print(f"║  {i}  {tag}  ({proto} {addr}){marker}{lat_str}")
+    print("╠══════════════════════════════════════════╣")
+    print("║  t  测试当前节点延迟                     ║")
+    print("║  T  测试所有节点延迟                     ║")
+    print("║  u  更新订阅                             ║")
+    print("║  q  退出                                 ║")
+    print("╚══════════════════════════════════════════╝")
+    print(f"  当前: {cur}")
+    print()
+
+def interactive():
+    latencies = {}
+    while True:
+        draw_menu(latencies)
+        try:
+            choice = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not choice:
+            continue
+        if choice in ("q", "Q", "exit"):
+            break
+
+        # 测试当前
+        if choice in ("t", "T") and choice == "t":
+            print("  测试中...")
+            lats = [curl_once() for _ in range(3)]
+            avg = sum(l for l in lats if l) / max(len([l for l in lats if l]), 1)
+            print(f"  延迟: {' '.join(fmt_lat(l) for l in lats)}  avg={fmt_lat(avg)}")
+            input("  回车继续...")
+            continue
+
+        # 测试所有
+        if choice == "T":
+            latencies = test_all()
+            continue
+
+        # 更新订阅
+        if choice in ("u", "U"):
+            do_update()
+            latencies = {}
+            input("  回车继续...")
+            continue
+
+        # 数字切换
+        try:
+            idx = int(choice)
+        except ValueError:
+            continue
+
+        if 0 <= idx < len(NODES):
+            do_switch(idx)
+            latencies = {}
+            input("  回车继续...")
+
+# ── 操作函数 ──
+
+def do_switch(idx):
+    target = NODES[idx]
+    cfg = load()
+    cur = current_tag(cfg)
+    if target == cur:
+        print(f"  当前已是 {target}")
+        return
+    new_out = []
+    for o in cfg["outbounds"]:
+        if o["tag"] == target:
+            new_out.insert(0, o)
+        else:
+            new_out.append(o)
+    cfg["outbounds"] = new_out
+    save(cfg)
+    print(f"  🔀 {cur} → {target}")
+    ok = restart_xray()
+    print(f"  ✅ xray 已重启{'（端口就绪）' if ok else '（端口未验证）'}")
+
+def do_update():
+    if not os.path.exists(SUB_SCRIPT):
+        print(f"  ❌ 订阅脚本不存在: {SUB_SCRIPT}")
+        return
+    print("  📥 更新订阅...")
+    env = f". {SUB_ENV} && " if os.path.exists(SUB_ENV) else ""
+    r = subprocess.run(f"{env}{SUB_SCRIPT}", shell=True, capture_output=True, text=True, timeout=120)
+    if r.returncode == 0:
+        lines = [l for l in r.stdout.strip().split("\n") if l.strip()]
+        for l in lines[-5:]:
+            print(f"  {l}")
+        print("  ✅ 订阅更新完成，重启 xray...")
+        restart_xray()
+        print("  ✅ xray 已重启")
+    else:
+        print(f"  ❌ 订阅更新失败:")
+        for l in (r.stderr or r.stdout).strip().split("\n")[-5:]:
+            print(f"  {l}")
+
+def test_all():
+    """测所有节点延迟，返回 {idx: avg} dict"""
+    orig = current_tag()
+    orig_idx = NODES.index(orig) if orig in NODES else 0
+    latencies = {}
+    print("  测试所有节点...\n")
+    for i, tag in enumerate(NODES):
+        # 切到该节点
+        if tag != current_tag():
+            cfg = load()
+            new_out = []
+            for o in cfg["outbounds"]:
+                if o["tag"] == tag:
+                    new_out.insert(0, o)
+                else:
+                    new_out.append(o)
+            cfg["outbounds"] = new_out
+            save(cfg)
+            restart_xray()
+        # 测 3 次
+        lats = [curl_once() for _ in range(3)]
+        valid = [l for l in lats if l is not None]
+        avg = sum(valid) / len(valid) if valid else None
+        latencies[i] = avg
+        print(f"  {i}  {tag}  {fmt_lat(avg)}")
+    # 切回
+    if orig != current_tag():
+        cfg = load()
+        new_out = []
+        for o in cfg["outbounds"]:
+            if o["tag"] == orig:
+                new_out.insert(0, o)
+            else:
+                new_out.append(o)
+        cfg["outbounds"] = new_out
+        save(cfg)
+        restart_xray()
+    print(f"\n  已切回 {orig}")
+    best_idx = min(latencies, key=lambda k: latencies[k] if latencies[k] else 999)
+    if latencies[best_idx] and latencies[best_idx] < 999:
+        print(f"  🏆 最快: {NODES[best_idx]}  {fmt_lat(latencies[best_idx])}")
+    return latencies
+
+# ── 非交互模式 ──
+
+def direct_switch(idx):
+    if idx < 0 or idx >= len(NODES):
+        print(f"❌ 序号 {idx} 越界，范围 0-{len(NODES)-1}")
+        sys.exit(1)
+    do_switch(idx)
+    print("延迟:")
+    for i in range(3):
+        lat = curl_once()
+        print(f"  #{i+1} {fmt_lat(lat)}")
+        time.sleep(0.5)
+
+def test_current():
+    cur = current_tag()
+    print(f"当前: {cur}")
+    for i in range(3):
+        lat = curl_once()
+        print(f"  #{i+1} {fmt_lat(lat)}")
+        time.sleep(0.5)
+
+def test_all_cli():
+    test_all()
+
+def update_cli():
+    do_update()
+
+# ── 主入口 ──
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        # 检测 stdin 是否是终端（非终端则走非交互模式列出节点）
+        if sys.stdin.isatty():
+            interactive()
+        else:
+            cur = current_tag()
+            print(f"当前: {cur}")
+            cfg = load()
+            for i, tag in enumerate(NODES):
+                proto, addr = get_node_info(cfg, tag)
+                marker = " 👈" if tag == cur else ""
+                print(f"  {i}  {tag}  ({proto} {addr}){marker}")
+        return
+    if args[0] == "-t":
+        test_current()
+        return
+    if args[0] == "-T":
+        test_all_cli()
+        return
+    if args[0] == "-u":
+        update_cli()
+        return
+    try:
+        idx = int(args[0])
+    except ValueError:
+        print(f"❌ 输入数字序号")
+        sys.exit(1)
+    direct_switch(idx)
+
+if __name__ == "__main__":
+    main()
