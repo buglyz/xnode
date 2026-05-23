@@ -1,85 +1,110 @@
 #!/usr/bin/env python3
-"""xnode — xray 节点切换 CLI
+"""xnode — xray 一键管理工具
 
-交互式菜单，输入序号切换，q 退出。
+安装 xray、管理订阅、切换节点、延迟测试，一个脚本全搞定。
 
 用法:
-  xnode           交互式菜单
-  xnode 2         直接切到序号 2
-  xnode -t        测当前节点延迟
-  xnode -T        测所有节点延迟
-  xnode -u        更新订阅
+  xnode               交互式主菜单
+  xnode 2             直接切到序号 2
+  xnode -t            测当前节点延迟
+  xnode -T            测所有节点延迟
+  xnode -u            更新订阅
+  xnode -i            安装 xray
+  xnode -s            查看服务状态
 """
 
-import json, sys, subprocess, time, os, signal
+import base64, json, os, platform, re, shutil, subprocess, sys, time
+from urllib.parse import urlparse, parse_qs, unquote
+from pathlib import Path
 
-CONFIG = "/usr/local/etc/xray/config.json"
-SYSTEMD = "xray"
-SUB_SCRIPT = "/usr/local/bin/xray-sub-sync"
+# ── 路径配置 ──
+
+XRAY_BIN = "/usr/local/bin/xray"
+XRAY_DIR = "/usr/local/etc/xray"
+CONFIG = f"{XRAY_DIR}/config.json"
+GEOIP = "/usr/local/share/xray/geoip.dat"
+GEOSITE = "/usr/local/share/xray/geosite.dat"
+SYSTEMD_UNIT = "/etc/systemd/system/xray.service"
 SUB_ENV = "/etc/xray-sub-sync.env"
+SERVICE = "xray"
 
-NODES = [
-    "🇯🇵 VLESS-Tokyo",
-    "🇭🇰 VLESS-HK",
-    "🇯🇵 SS-Tokyo",
-    "🇺🇸 VLESS-US",
-    "🇬🇧 VLESS-London",
-]
+SOCKS_PORT = 20170
+HTTP_PORT = 20171
+
+# ── 颜色 ──
+
+R = "\033[0m"
+B = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
 
 # ── 工具函数 ──
 
-def load():
+def clear():
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+def run_ok(cmd, **kw):
+    r = run(cmd, **kw)
+    return r.returncode == 0
+
+def xray_installed():
+    return os.path.isfile(XRAY_BIN) and os.access(XRAY_BIN, os.X_OK)
+
+def service_active():
+    return run_ok(["systemctl", "is-active", "--quiet", SERVICE])
+
+def load_cfg():
+    if not os.path.isfile(CONFIG):
+        return None
     with open(CONFIG) as f:
         return json.load(f)
 
-def save(cfg):
+def save_cfg(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
     tmp = CONFIG + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG)
 
-def restart_xray():
-    r = subprocess.run(["systemctl", "restart", SYSTEMD], capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"❌ restart 失败: {r.stderr.strip()}")
-        return False
-    for _ in range(10):
-        try:
-            subprocess.run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
-                           "-o", "/dev/null", "--max-time", "3",
-                           f"https://www.google.com/?_={int(time.time()*1000)}"],
-                          capture_output=True, timeout=5)
-            return True
-        except Exception:
-            time.sleep(0.3)
-    return False
+def get_nodes(cfg=None):
+    """从 config 提取代理节点列表（排除 direct/block）"""
+    cfg = cfg or load_cfg()
+    if not cfg:
+        return []
+    return [o for o in cfg.get("outbounds", []) if o["tag"] not in ("direct", "block")]
 
 def current_tag(cfg=None):
-    cfg = cfg or load()
-    for o in cfg["outbounds"]:
-        if o["tag"] in NODES:
+    cfg = cfg or load_cfg()
+    if not cfg:
+        return None
+    for o in cfg.get("outbounds", []):
+        if o["tag"] not in ("direct", "block"):
             return o["tag"]
     return None
 
-def get_node_info(cfg, tag):
-    for o in cfg["outbounds"]:
-        if o["tag"] == tag:
-            proto = o["protocol"].upper()
-            addr = ""
-            if "vnext" in o["settings"]:
-                addr = o["settings"]["vnext"][0]["address"]
-            elif "servers" in o["settings"]:
-                addr = o["settings"]["servers"][0]["address"]
-            return proto, addr
-    return "?", "?"
+def node_info(ob):
+    proto = ob["protocol"].upper()
+    addr = ""
+    if "vnext" in ob["settings"]:
+        addr = ob["settings"]["vnext"][0]["address"]
+    elif "servers" in ob["settings"]:
+        addr = ob["settings"]["servers"][0]["address"]
+    return proto, addr
 
 def curl_once():
     try:
-        r = subprocess.run(
-            ["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
-             "-o", "/dev/null", "-w", "%{time_total}",
-             "--max-time", "10", f"https://www.google.com/?_={int(time.time()*1000)}"],
-            capture_output=True, text=True, timeout=15)
+        r = run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
+                 "-o", "/dev/null", "-w", "%{time_total}",
+                 "--max-time", "10",
+                 f"https://www.google.com/?_={int(time.time()*1000)}"],
+                timeout=15)
         s = r.stdout.strip()
         return float(s) if s else None
     except Exception:
@@ -87,48 +112,635 @@ def curl_once():
 
 def fmt_lat(v):
     if v is None:
-        return "❌ 超时"
+        return f"{RED}❌ 超时{R}"
     if v < 1:
-        return f"{v:.3f}s"
+        return f"{GREEN}{v:.3f}s{R}"
     if v < 3:
-        return f"{v:.2f}s"
-    return f"{v:.1f}s ⚠️"
+        return f"{YELLOW}{v:.2f}s{R}"
+    return f"{RED}{v:.1f}s ⚠️{R}"
+
+def restart_xray():
+    r = run(["systemctl", "restart", SERVICE])
+    if r.returncode != 0:
+        print(f"  {RED}❌ restart 失败: {r.stderr.strip()}{R}")
+        return False
+    for _ in range(10):
+        try:
+            run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
+                 "-o", "/dev/null", "--max-time", "3",
+                 f"https://www.google.com/?_={int(time.time()*1000)}"],
+                timeout=5)
+            return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+def get_sub_url():
+    if os.path.isfile(SUB_ENV):
+        with open(SUB_ENV) as f:
+            for line in f:
+                if line.startswith("XRAY_SUB_URL="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    return ""
+
+def set_sub_url(url):
+    lines = []
+    if os.path.isfile(SUB_ENV):
+        with open(SUB_ENV) as f:
+            lines = f.readlines()
+    found = False
+    for i, l in enumerate(lines):
+        if l.startswith("XRAY_SUB_URL="):
+            lines[i] = f'XRAY_SUB_URL="{url}"\n'
+            found = True
+            break
+    if not found:
+        lines.append(f'XRAY_SUB_URL="{url}"\n')
+    # 确保 其他必要变量
+    has_socks = any(l.startswith("XRAY_SOCKS_PORT=") for l in lines)
+    has_http = any(l.startswith("XRAY_HTTP_PORT=") for l in lines)
+    has_config = any(l.startswith("XRAY_CONFIG=") for l in lines)
+    if not has_socks:
+        lines.append(f'XRAY_SOCKS_PORT="{SOCKS_PORT}"\n')
+    if not has_http:
+        lines.append(f'XRAY_HTTP_PORT="{HTTP_PORT}"\n')
+    if not has_config:
+        lines.append(f'XRAY_CONFIG="{CONFIG}"\n')
+    with open(SUB_ENV, "w") as f:
+        f.writelines(lines)
+
+# ── 默认配置（直通模式）──
+
+def write_default_config():
+    """写入最小默认配置：SOCKS5 + HTTP 直通（无代理节点）。
+    安装后端口立即可用，添加订阅后会被覆盖。"""
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"tag": "socks", "listen": "127.0.0.1", "port": SOCKS_PORT,
+             "protocol": "socks", "settings": {"auth": "noauth", "udp": True},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}},
+            {"tag": "http", "listen": "127.0.0.1", "port": HTTP_PORT,
+             "protocol": "http", "settings": {},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}},
+        ],
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {}},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn"]},
+                {"type": "field", "outboundTag": "direct", "ip": ["geoip:private", "geoip:cn"]},
+            ],
+        },
+    }
+    save_cfg(cfg)
+    print(f"  {DIM}默认配置已写入（直通模式）{R}")
+
+# ── 安装 ──
+
+def install_xray():
+    clear()
+    print(f"\n  {B}{CYAN}═══ 安装 xray-core ═══{R}\n")
+
+    if xray_installed():
+        v = run([XRAY_BIN, "version"])
+        first = v.stdout.split("\n")[0] if v.stdout else "?"
+        print(f"  已安装: {first}")
+        print(f"  {DIM}路径: {XRAY_BIN}{R}")
+        a = input(f"\n  {YELLOW}重新安装? [y/N]{R} ").strip().lower()
+        if a != "y":
+            return
+
+    # 检测架构
+    arch = platform.machine().lower()
+    arch_map = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm32"}
+    go_arch = arch_map.get(arch, arch)
+    print(f"  架构: {arch} → {go_arch}")
+
+    # 获取最新版本
+    print("  获取最新版本...")
+    r = run(["curl", "-sf", "https://api.github.com/repos/XTLS/Xray-core/releases/latest"])
+    if r.returncode != 0:
+        print(f"  {RED}❌ 无法获取版本信息{R}")
+        return
+    try:
+        info = json.loads(r.stdout)
+        version = info["tag_name"]
+        assets = info.get("assets", [])
+    except Exception:
+        print(f"  {RED}❌ 解析版本信息失败{R}")
+        return
+    print(f"  最新版本: {version}")
+
+    # 找下载 URL
+    dl_name = f"Xray-{version[1:]}-linux-{go_arch}.zip"
+    dl_url = None
+    for a in assets:
+        if a["name"] == dl_name:
+            dl_url = a["browser_download_url"]
+            break
+    if not dl_url:
+        # 尝试不带 v 前缀
+        dl_name2 = f"Xray-linux-{go_arch}.zip"
+        for a in assets:
+            if a["name"].endswith(f"linux-{go_arch}.zip"):
+                dl_url = a["browser_download_url"]
+                break
+    if not dl_url:
+        print(f"  {RED}❌ 找不到 {dl_name}{R}")
+        return
+
+    # 下载
+    tmpdir = "/tmp/xray-install"
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    os.makedirs(tmpdir, exist_ok=True)
+    zipfile = f"{tmpdir}/{dl_name}"
+
+    print(f"  下载中...")
+    r = run(["curl", "-L", "-f", "--progress-bar", "-o", zipfile, dl_url], timeout=120)
+    if r.returncode != 0:
+        print(f"  {RED}❌ 下载失败{R}")
+        return
+
+    # 解压
+    print("  解压...")
+    r = run(["unzip", "-o", zipfile, "-d", tmpdir])
+    if r.returncode != 0:
+        print(f"  {RED}❌ 解压失败{R}")
+        return
+
+    # 安装文件
+    print("  安装文件...")
+    os.makedirs(XRAY_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(GEOIP), exist_ok=True)
+
+    # 找 xray 二进制
+    xray_src = f"{tmpdir}/xray"
+    if not os.path.isfile(xray_src):
+        print(f"  {RED}❌ 找不到 xray 二进制{R}")
+        return
+    shutil.copy2(xray_src, XRAY_BIN)
+    os.chmod(XRAY_BIN, 0o755)
+
+    # geo 文件
+    for name, dst in [("geoip.dat", GEOIP), ("geosite.dat", GEOSITE)]:
+        src = f"{tmpdir}/{name}"
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+
+    # 写 systemd unit
+    print("  写 systemd 服务...")
+    with open(SYSTEMD_UNIT, "w") as f:
+        f.write(f"""[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart={XRAY_BIN} run -config {CONFIG}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+""")
+
+    run(["systemctl", "daemon-reload"])
+
+    # 写默认配置（直通模式，SOCKS5+HTTP 端口立即可用）
+    if not os.path.isfile(CONFIG):
+        write_default_config()
+
+    # 验证
+    v = run([XRAY_BIN, "version"])
+    first = v.stdout.split("\n")[0] if v.stdout else "?"
+    print(f"\n  {GREEN}✅ 安装完成: {first}{R}")
+    print(f"  {DIM}{XRAY_BIN}{R}")
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 启动
+    a = input(f"\n  {CYAN}启动 xray? [Y/n]{R} ").strip().lower()
+    if a != "n":
+        run(["systemctl", "enable", "--now", SERVICE])
+        print(f"  {GREEN}✅ xray 已启动{R}")
+        print(f"  {DIM}SOCKS5: 127.0.0.1:{SOCKS_PORT}  HTTP: 127.0.0.1:{HTTP_PORT}{R}")
+        print(f"  {DIM}当前为直通模式（无代理），添加订阅后自动切换{R}")
+
+# ── 订阅管理 ──
+
+def manage_sub():
+    clear()
+    print(f"\n  {B}{CYAN}═══ 订阅管理 ═══{R}\n")
+
+    url = get_sub_url()
+    if url:
+        # 隐藏 URL 中间
+        display = url[:40] + "..." + url[-20:] if len(url) > 60 else url
+        print(f"  当前订阅: {display}")
+    else:
+        print(f"  {YELLOW}未配置订阅{R}")
+
+    print()
+    print(f"  1  添加/修改订阅 URL")
+    print(f"  2  更新订阅（拉取节点并重启 xray）")
+    print(f"  3  删除订阅")
+    print(f"  0  返回")
+    print()
+
+    choice = input("  > ").strip()
+    if choice == "1":
+        new_url = input("  订阅 URL: ").strip()
+        if new_url:
+            set_sub_url(new_url)
+            print(f"\n  {GREEN}✅ 已保存{R}")
+            a = input(f"  {CYAN}立即更新? [Y/n]{R} ").strip().lower()
+            if a != "n":
+                sync_sub()
+        else:
+            print(f"  {RED}URL 不能为空{R}")
+    elif choice == "2":
+        sync_sub()
+    elif choice == "3":
+        if os.path.isfile(SUB_ENV):
+            os.remove(SUB_ENV)
+            print(f"  {GREEN}✅ 已删除{R}")
+        else:
+            print(f"  无订阅配置")
+
+def sync_sub():
+    """拉取订阅、解析、生成 config、重启 xray"""
+    url = get_sub_url()
+    if not url:
+        print(f"  {RED}❌ 未配置订阅 URL{R}")
+        return False
+
+    print(f"  📥 拉取订阅...")
+
+    # 用代理拉取（如果 xray 正在运行）
+    proxy = ""
+    if service_active():
+        proxy = f" --proxy socks5://127.0.0.1:{SOCKS_PORT}"
+
+    r = run(["curl", "-sf", "--connect-timeout", "15", "--max-time", "60"] +
+            (["--proxy", f"socks5://127.0.0.1:{SOCKS_PORT}"] if proxy else []) +
+            [url], timeout=90)
+    if r.returncode != 0 or not r.stdout.strip():
+        print(f"  {RED}❌ 拉取失败{R}")
+        return False
+
+    raw = r.stdout.strip()
+
+    # 解码
+    try:
+        decoded = base64.b64decode(raw + "==").decode("utf-8")
+        links = [l.strip() for l in decoded.split("\n") if l.strip()]
+    except Exception:
+        links = [l.strip() for l in raw.split("\n") if l.strip()]
+
+    print(f"  解码 {len(links)} 条链接")
+
+    # 解析
+    outbounds = []
+    for link in links:
+        ob = parse_vless(link) or parse_vmess(link) or parse_ss(link)
+        if ob:
+            outbounds.append(ob)
+            print(f"    {GREEN}✅{R} {ob['tag']} ({ob['protocol']})")
+        else:
+            proto = link.split("://")[0] if "://" in link else "?"
+            print(f"    {DIM}⏭️{R} {proto}:// (不支持)")
+
+    if not outbounds:
+        print(f"  {RED}❌ 没有可用节点{R}")
+        return False
+
+    # 生成 config
+    config = generate_config(outbounds)
+
+    # 写入
+    tmp = CONFIG + ".sync"
+    with open(tmp, "w") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    # 验证
+    r = run([XRAY_BIN, "run", "-test", "-format", "json", "-config", tmp])
+    if r.returncode != 0:
+        print(f"  {RED}❌ 配置验证失败{R}")
+        os.remove(tmp)
+        return False
+
+    # 原子替换
+    os.replace(tmp, CONFIG)
+    print(f"  {GREEN}✅ 配置已更新 ({len(outbounds)} 个节点){R}")
+
+    # 重启
+    restart_xray()
+    print(f"  {GREEN}✅ xray 已重启{R}")
+    return True
+
+# ── 协议解析 ──
+
+def parse_vless(link):
+    if not link.startswith("vless://"):
+        return None
+    u = urlparse(link)
+    params = parse_qs(u.query)
+    uuid = u.username
+    address = u.hostname
+    port = int(u.port or 443)
+    name = unquote(u.fragment) if u.fragment else f"{address}:{port}"
+    security = params.get("security", ["none"])[0]
+    sni = params.get("sni", [""])[0]
+    flow = params.get("flow", [""])[0]
+    fp = params.get("fp", [""])[0]
+    pbk = params.get("pbk", [""])[0]
+    sid = params.get("sid", [""])[0]
+    net = params.get("type", ["tcp"])[0]
+
+    outbound = {
+        "tag": name, "protocol": "vless",
+        "settings": {"vnext": [{"address": address, "port": port,
+                    "users": [{"id": uuid, "encryption": "none", "flow": flow}]}]},
+        "streamSettings": {"network": net, "security": security}
+    }
+    if security == "reality":
+        outbound["streamSettings"]["realitySettings"] = {
+            "serverName": sni, "fingerprint": fp,
+            "publicKey": pbk, "shortId": sid}
+    elif security == "tls":
+        outbound["streamSettings"]["tlsSettings"] = {
+            "serverName": sni, "fingerprint": fp}
+    return outbound
+
+def parse_vmess(link):
+    if not link.startswith("vmess://"):
+        return None
+    try:
+        b64 = link[8:]
+        d = json.loads(base64.b64decode(b64 + "==").decode("utf-8"))
+        outbound = {
+            "tag": d.get("ps", f"{d['add']}:{d['port']}"),
+            "protocol": "vmess",
+            "settings": {"vnext": [{"address": d["add"], "port": int(d["port"]),
+                        "users": [{"id": d["id"], "alterId": int(d.get("aid", 0)),
+                                   "security": d.get("scy", "auto")}]}]},
+            "streamSettings": {"network": d.get("net", "tcp")}
+        }
+        if d.get("net") == "ws":
+            outbound["streamSettings"]["wsSettings"] = {
+                "path": d.get("path", "/"),
+                "headers": {"Host": d.get("host", "")} if d.get("host") else {}}
+        if d.get("tls") == "tls":
+            outbound["streamSettings"]["security"] = "tls"
+            outbound["streamSettings"]["tlsSettings"] = {
+                "serverName": d.get("sni", d.get("host", ""))}
+        return outbound
+    except Exception:
+        return None
+
+def parse_ss(link):
+    if not link.startswith("ss://"):
+        return None
+    try:
+        rest = link[5:]
+        name = ""
+        if "#" in rest:
+            rest, name = rest.rsplit("#", 1)
+            name = unquote(name)
+        if "?" in rest:
+            rest = rest.split("?")[0]
+        if "@" in rest:
+            userinfo, hostport = rest.rsplit("@", 1)
+            if ":" in userinfo:
+                method, password = userinfo.split(":", 1)
+            else:
+                decoded = base64.b64decode(userinfo + "==").decode("utf-8")
+                method, password = decoded.split(":", 1)
+            host, port = hostport.rsplit(":", 1)
+            return {"tag": name or f"{host}:{port}", "protocol": "shadowsocks",
+                    "settings": {"servers": [{"address": host, "port": int(port),
+                                "password": password, "method": method}]}}
+    except Exception:
+        return None
+    return None
+
+def generate_config(outbounds):
+    all_out = list(outbounds) + [
+        {"tag": "direct", "protocol": "freedom", "settings": {}},
+        {"tag": "block", "protocol": "blackhole", "settings": {}},
+    ]
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"tag": "socks", "listen": "127.0.0.1", "port": SOCKS_PORT,
+             "protocol": "socks", "settings": {"auth": "noauth", "udp": True},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}},
+            {"tag": "http", "listen": "127.0.0.1", "port": HTTP_PORT,
+             "protocol": "http", "settings": {},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}},
+        ],
+        "outbounds": all_out,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn"]},
+                {"type": "field", "outboundTag": "direct", "ip": ["geoip:private", "geoip:cn"]},
+            ],
+        },
+    }
+
+# ── 节点切换 ──
+
+def do_switch(idx, nodes):
+    if idx < 0 or idx >= len(nodes):
+        print(f"  {RED}❌ 序号 {idx} 越界{R}")
+        return
+    target = nodes[idx]["tag"]
+    cfg = load_cfg()
+    cur = current_tag(cfg)
+    if target == cur:
+        print(f"  当前已是 {target}")
+        return
+    new_out = [nodes[idx]] + [o for o in cfg["outbounds"] if o["tag"] != target]
+    cfg["outbounds"] = new_out
+    save_cfg(cfg)
+    print(f"  🔀 {cur} → {target}")
+    ok = restart_xray()
+    print(f"  {'✅' if ok else '⚠️'} xray 已重启{'（端口就绪）' if ok else '（端口未验证）'}")
+
+# ── 延迟测试 ──
+
+def test_current():
+    cur = current_tag()
+    if not cur:
+        print(f"  {RED}❌ 无可用节点{R}")
+        return
+    print(f"  当前: {cur}")
+    for i in range(3):
+        lat = curl_once()
+        print(f"  #{i+1} {fmt_lat(lat)}")
+        time.sleep(0.5)
+
+def test_all():
+    cfg = load_cfg()
+    if not cfg:
+        print(f"  {RED}❌ 无配置{R}")
+        return {}
+    nodes = get_nodes(cfg)
+    orig = current_tag(cfg)
+    latencies = {}
+
+    print(f"  测试 {len(nodes)} 个节点...\n")
+    for i, node in enumerate(nodes):
+        tag = node["tag"]
+        if tag != current_tag():
+            new_out = [node] + [o for o in load_cfg()["outbounds"] if o["tag"] != tag]
+            cfg2 = load_cfg()
+            cfg2["outbounds"] = new_out
+            save_cfg(cfg2)
+            restart_xray()
+        lats = [curl_once() for _ in range(3)]
+        valid = [l for l in lats if l is not None]
+        avg = sum(valid) / len(valid) if valid else None
+        latencies[i] = avg
+        proto, addr = node_info(node)
+        marker = f" {GREEN}👈{R}" if tag == orig else ""
+        print(f"  {i}  {tag}  ({proto} {addr})  {fmt_lat(avg)}{marker}")
+
+    # 切回
+    if orig != current_tag():
+        cfg2 = load_cfg()
+        new_out = [o for o in cfg2["outbounds"] if o["tag"] == orig]
+        new_out += [o for o in cfg2["outbounds"] if o["tag"] != orig]
+        cfg2["outbounds"] = new_out
+        save_cfg(cfg2)
+        restart_xray()
+        print(f"\n  已切回 {orig}")
+
+    best_i = min(latencies, key=lambda k: latencies[k] if latencies[k] else 999)
+    if latencies[best_i] and latencies[best_i] < 999:
+        print(f"\n  🏆 最快: {nodes[best_i]['tag']}  {fmt_lat(latencies[best_i])}")
+    return latencies
+
+# ── 服务状态 ──
+
+def show_status():
+    clear()
+    print(f"\n  {B}{CYAN}═══ 服务状态 ═══{R}\n")
+
+    if not xray_installed():
+        print(f"  {RED}xray 未安装{R}")
+        return
+
+    v = run([XRAY_BIN, "version"])
+    first = v.stdout.split("\n")[0] if v.stdout else "?"
+    print(f"  版本:  {first}")
+
+    active = service_active()
+    print(f"  状态:  {'🟢 运行中' if active else '🔴 未运行'}")
+
+    if active:
+        # PID
+        r = run(["systemctl", "show", SERVICE, "--property=MainPID"])
+        pid = r.stdout.strip().split("=")[-1] if r.returncode == 0 else "?"
+        print(f"  PID:   {pid}")
+
+        # 内存
+        r = run(["systemctl", "show", SERVICE, "--property=MemoryCurrent"])
+        mem = r.stdout.strip().split("=")[-1] if r.returncode == 0 else "?"
+        try:
+            mem_mb = int(mem) / 1024 / 1024
+            print(f"  内存:  {mem_mb:.1f} MB")
+        except Exception:
+            pass
+
+        # 运行时间
+        r = run(["systemctl", "show", SERVICE, "--property=ActiveEnterTimestamp"])
+        ts = r.stdout.strip().split("=", 1)[-1] if r.returncode == 0 else ""
+        if ts:
+            print(f"  启动于: {ts}")
+
+    # 端口
+    print(f"\n  SOCKS5: 127.0.0.1:{SOCKS_PORT}")
+    print(f"  HTTP:   127.0.0.1:{HTTP_PORT}")
+
+    # 节点
+    cfg = load_cfg()
+    if cfg:
+        cur = current_tag(cfg)
+        nodes = get_nodes(cfg)
+        print(f"\n  当前节点: {cur}")
+        print(f"  节点数:   {len(nodes)}")
+
+    # 订阅
+    url = get_sub_url()
+    if url:
+        print(f"\n  订阅:   {url[:50]}{'...' if len(url)>50 else ''}")
+
+    # 最近日志
+    if active:
+        print(f"\n  {DIM}--- 最近日志 ---{R}")
+        r = run(["journalctl", "-u", SERVICE, "-n", "5", "--no-pager"])
+        for line in r.stdout.strip().split("\n"):
+            print(f"  {DIM}{line}{R}")
 
 # ── 交互式菜单 ──
 
-def clear():
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-
-def draw_menu(latencies=None):
-    cfg = load()
-    cur = current_tag(cfg)
+def draw_main_menu():
     clear()
-    print("╔══════════════════════════════════════════╗")
-    print("║          xnode — xray 节点切换           ║")
-    print("╠══════════════════════════════════════════╣")
-    for i, tag in enumerate(NODES):
-        proto, addr = get_node_info(cfg, tag)
-        marker = " 👈" if tag == cur else "   "
-        lat_str = ""
-        if latencies and i in latencies:
-            lat_str = f"  {fmt_lat(latencies[i])}"
-        print(f"║  {i}  {tag}  ({proto} {addr}){marker}{lat_str}")
-    print("╠══════════════════════════════════════════╣")
-    print("║  t  测试当前节点延迟                     ║")
-    print("║  T  测试所有节点延迟                     ║")
-    print("║  u  更新订阅                             ║")
-    print("║  q  退出                                 ║")
-    print("╚══════════════════════════════════════════╝")
-    print(f"  当前: {cur}")
-    print()
+    print(f"""
+  {B}{CYAN}╔══════════════════════════════════════════╗
+  ║            xnode — xray 管理工具         ║
+  ╚══════════════════════════════════════════╝{R}""")
+
+    # 安装状态
+    if not xray_installed():
+        print(f"\n  {RED}⚠️ xray 未安装{R}")
+        print(f"\n  {B}i{R}  安装 xray")
+        print(f"\n  {B}q{R}  退出")
+        return
+
+    # 服务状态
+    active = service_active()
+    status = f"{GREEN}🟢 运行中{R}" if active else f"{RED}🔴 未运行{R}"
+    cur = current_tag() or "无"
+    print(f"\n  状态: {status}    当前: {cur}")
+
+    # 节点列表
+    cfg = load_cfg()
+    nodes = get_nodes(cfg) if cfg else []
+    if nodes:
+        print(f"\n  {B}── 节点 ──{R}")
+        for i, node in enumerate(nodes):
+            proto, addr = node_info(node)
+            marker = f" {GREEN}👈{R}" if node["tag"] == current_tag(cfg) else ""
+            print(f"  {B}{i}{R}  {node['tag']}  ({proto} {addr}){marker}")
+
+    # 操作
+    print(f"""
+  {B}── 操作 ──{R}
+  {B}t{R}  测试当前节点延迟
+  {B}T{R}  测试所有节点延迟
+  {B}u{R}  更新订阅
+  {B}s{R}  订阅管理（添加/修改/删除）
+  {B}S{R}  服务状态
+  {B}r{R}  重启 xray
+  {B}i{R}  重装 xray
+  {B}q{R}  退出""")
 
 def interactive():
-    latencies = {}
     while True:
-        draw_menu(latencies)
+        draw_main_menu()
         try:
-            choice = input("  > ").strip()
+            choice = input("\n  > ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -138,180 +750,95 @@ def interactive():
         if choice in ("q", "Q", "exit"):
             break
 
-        # 测试当前
-        if choice in ("t", "T") and choice == "t":
-            print("  测试中...")
-            lats = [curl_once() for _ in range(3)]
-            avg = sum(l for l in lats if l) / max(len([l for l in lats if l]), 1)
-            print(f"  延迟: {' '.join(fmt_lat(l) for l in lats)}  avg={fmt_lat(avg)}")
-            input("  回车继续...")
-            continue
+        cfg = load_cfg()
+        nodes = get_nodes(cfg) if cfg else []
 
-        # 测试所有
-        if choice == "T":
-            latencies = test_all()
-            continue
-
-        # 更新订阅
-        if choice in ("u", "U"):
-            do_update()
-            latencies = {}
-            input("  回车继续...")
-            continue
-
-        # 数字切换
+        # 数字 → 切换节点
         try:
             idx = int(choice)
-        except ValueError:
+            if 0 <= idx < len(nodes):
+                do_switch(idx, nodes)
+                input("\n  回车继续...")
             continue
+        except ValueError:
+            pass
 
-        if 0 <= idx < len(NODES):
-            do_switch(idx)
-            latencies = {}
-            input("  回车继续...")
-
-# ── 操作函数 ──
-
-def do_switch(idx):
-    target = NODES[idx]
-    cfg = load()
-    cur = current_tag(cfg)
-    if target == cur:
-        print(f"  当前已是 {target}")
-        return
-    new_out = []
-    for o in cfg["outbounds"]:
-        if o["tag"] == target:
-            new_out.insert(0, o)
-        else:
-            new_out.append(o)
-    cfg["outbounds"] = new_out
-    save(cfg)
-    print(f"  🔀 {cur} → {target}")
-    ok = restart_xray()
-    print(f"  ✅ xray 已重启{'（端口就绪）' if ok else '（端口未验证）'}")
-
-def do_update():
-    if not os.path.exists(SUB_SCRIPT):
-        print(f"  ❌ 订阅脚本不存在: {SUB_SCRIPT}")
-        return
-    print("  📥 更新订阅...")
-    env = f". {SUB_ENV} && " if os.path.exists(SUB_ENV) else ""
-    r = subprocess.run(f"{env}{SUB_SCRIPT}", shell=True, capture_output=True, text=True, timeout=120)
-    if r.returncode == 0:
-        lines = [l for l in r.stdout.strip().split("\n") if l.strip()]
-        for l in lines[-5:]:
-            print(f"  {l}")
-        print("  ✅ 订阅更新完成，重启 xray...")
-        restart_xray()
-        print("  ✅ xray 已重启")
-    else:
-        print(f"  ❌ 订阅更新失败:")
-        for l in (r.stderr or r.stdout).strip().split("\n")[-5:]:
-            print(f"  {l}")
-
-def test_all():
-    """测所有节点延迟，返回 {idx: avg} dict"""
-    orig = current_tag()
-    orig_idx = NODES.index(orig) if orig in NODES else 0
-    latencies = {}
-    print("  测试所有节点...\n")
-    for i, tag in enumerate(NODES):
-        # 切到该节点
-        if tag != current_tag():
-            cfg = load()
-            new_out = []
-            for o in cfg["outbounds"]:
-                if o["tag"] == tag:
-                    new_out.insert(0, o)
-                else:
-                    new_out.append(o)
-            cfg["outbounds"] = new_out
-            save(cfg)
+        if choice == "t":
+            test_current()
+            input("\n  回车继续...")
+        elif choice == "T":
+            test_all()
+            input("\n  回车继续...")
+        elif choice == "u":
+            sync_sub()
+            input("\n  回车继续...")
+        elif choice == "s":
+            manage_sub()
+            input("\n  回车继续...")
+        elif choice == "S":
+            show_status()
+            input("\n  回车继续...")
+        elif choice == "r":
+            print("  重启 xray...")
             restart_xray()
-        # 测 3 次
-        lats = [curl_once() for _ in range(3)]
-        valid = [l for l in lats if l is not None]
-        avg = sum(valid) / len(valid) if valid else None
-        latencies[i] = avg
-        print(f"  {i}  {tag}  {fmt_lat(avg)}")
-    # 切回
-    if orig != current_tag():
-        cfg = load()
-        new_out = []
-        for o in cfg["outbounds"]:
-            if o["tag"] == orig:
-                new_out.insert(0, o)
-            else:
-                new_out.append(o)
-        cfg["outbounds"] = new_out
-        save(cfg)
-        restart_xray()
-    print(f"\n  已切回 {orig}")
-    best_idx = min(latencies, key=lambda k: latencies[k] if latencies[k] else 999)
-    if latencies[best_idx] and latencies[best_idx] < 999:
-        print(f"  🏆 最快: {NODES[best_idx]}  {fmt_lat(latencies[best_idx])}")
-    return latencies
+            print(f"  {GREEN}✅ 已重启{R}")
+            input("\n  回车继续...")
+        elif choice in ("i", "I"):
+            install_xray()
+            input("\n  回车继续...")
 
 # ── 非交互模式 ──
 
 def direct_switch(idx):
-    if idx < 0 or idx >= len(NODES):
-        print(f"❌ 序号 {idx} 越界，范围 0-{len(NODES)-1}")
+    cfg = load_cfg()
+    nodes = get_nodes(cfg)
+    if idx < 0 or idx >= len(nodes):
+        print(f"❌ 序号 {idx} 越界，范围 0-{len(nodes)-1}")
         sys.exit(1)
-    do_switch(idx)
-    print("延迟:")
+    do_switch(idx, nodes)
     for i in range(3):
         lat = curl_once()
         print(f"  #{i+1} {fmt_lat(lat)}")
         time.sleep(0.5)
-
-def test_current():
-    cur = current_tag()
-    print(f"当前: {cur}")
-    for i in range(3):
-        lat = curl_once()
-        print(f"  #{i+1} {fmt_lat(lat)}")
-        time.sleep(0.5)
-
-def test_all_cli():
-    test_all()
-
-def update_cli():
-    do_update()
 
 # ── 主入口 ──
 
 def main():
     args = sys.argv[1:]
+
     if not args:
-        # 检测 stdin 是否是终端（非终端则走非交互模式列出节点）
         if sys.stdin.isatty():
             interactive()
         else:
+            # 非 TTY：列出节点
             cur = current_tag()
             print(f"当前: {cur}")
-            cfg = load()
-            for i, tag in enumerate(NODES):
-                proto, addr = get_node_info(cfg, tag)
-                marker = " 👈" if tag == cur else ""
-                print(f"  {i}  {tag}  ({proto} {addr}){marker}")
+            cfg = load_cfg()
+            nodes = get_nodes(cfg)
+            for i, node in enumerate(nodes):
+                proto, addr = node_info(node)
+                marker = " 👈" if node["tag"] == cur else ""
+                print(f"  {i}  {node['tag']}  ({proto} {addr}){marker}")
         return
-    if args[0] == "-t":
+
+    a = args[0]
+    if a == "-t":
         test_current()
-        return
-    if args[0] == "-T":
-        test_all_cli()
-        return
-    if args[0] == "-u":
-        update_cli()
-        return
-    try:
-        idx = int(args[0])
-    except ValueError:
-        print(f"❌ 输入数字序号")
-        sys.exit(1)
-    direct_switch(idx)
+    elif a == "-T":
+        test_all()
+    elif a == "-u":
+        sync_sub()
+    elif a == "-i":
+        install_xray()
+    elif a == "-s":
+        show_status()
+    else:
+        try:
+            idx = int(a)
+            direct_switch(idx)
+        except ValueError:
+            print(f"❌ 输入数字序号或 -t/-T/-u/-i/-s")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
