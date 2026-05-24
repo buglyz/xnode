@@ -482,12 +482,14 @@ def sync_sub():
 
     print(f"  📥 拉取订阅...")
 
-    proxy_args = []
-    if service_active():
-        proxy_args = ["--proxy", f"socks5://127.0.0.1:{SOCKS_PORT}"]
-
-    r = run(["curl", "-sf", "--connect-timeout", "15", "--max-time", "60"] +
-            proxy_args + [url], timeout=90)
+    # Try direct first, fall back to proxy if direct fails
+    # (proxy route to sub URL can be unreliable/slow)
+    r = run(["curl", "-sf", "--connect-timeout", "10", "--max-time", "30", url], timeout=45)
+    if r.returncode != 0 or not r.stdout.strip():
+        if service_active():
+            print(f"  {DIM}直连失败，尝试代理...{R}")
+            r = run(["curl", "-sf", "--connect-timeout", "15", "--max-time", "60",
+                     "--proxy", f"socks5://127.0.0.1:{SOCKS_PORT}", url], timeout=90)
     if r.returncode != 0 or not r.stdout.strip():
         print(f"  {RED}❌ 拉取失败{R}")
         return False
