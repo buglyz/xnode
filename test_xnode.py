@@ -8,6 +8,8 @@ temporary directory.
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -129,12 +131,29 @@ class XnodeHelperTests(unittest.TestCase):
         }
         setattr(self.xnode, "tcping", lambda host, port: latencies_by_host[host])
 
-        latencies = self.xnode.test_all()
+        with contextlib.redirect_stdout(io.StringIO()):
+            latencies = self.xnode.test_all()
 
         self.assertEqual(set(latencies), {1, 2, 3})
         self.assertAlmostEqual(latencies[1], 0.3)
         self.assertAlmostEqual(latencies[2], 0.1)
         self.assertAlmostEqual(latencies[3], 0.2)
+
+    def test_main_prints_help_and_exits_successfully_for_help_flags(self):
+        original_argv = self.xnode.sys.argv
+        try:
+            for flag in ("-h", "--help"):
+                with self.subTest(flag=flag):
+                    stdout = io.StringIO()
+                    setattr(self.xnode.sys, "argv", ["xnode", flag])
+                    with contextlib.redirect_stdout(stdout):
+                        self.xnode.main()
+                    output = stdout.getvalue()
+                    self.assertIn("用法:", output)
+                    self.assertIn("xnode -T", output)
+                    self.assertNotIn("❌", output)
+        finally:
+            setattr(self.xnode.sys, "argv", original_argv)
 
     def test_restart_xray_returns_false_when_readiness_never_succeeds(self):
         calls = []

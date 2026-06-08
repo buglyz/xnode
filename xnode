@@ -12,6 +12,7 @@
   xnode -u            更新订阅
   xnode -i            安装 xray
   xnode -s            查看服务状态
+  xnode -h, --help    显示帮助
 """
 
 import base64, json, os, platform, re, shutil, socket, subprocess, sys, time
@@ -1078,6 +1079,10 @@ def direct_switch(num):
         print(f"  #{i+1} {fmt_lat(lat)}")
         time.sleep(0.5)
 
+
+def print_help():
+    print(__doc__.strip())
+
 # ── 主入口 ──
 
 def main():
@@ -1099,7 +1104,9 @@ def main():
         return
 
     a = args[0]
-    if a == "-t":
+    if a in ("-h", "--help"):
+        print_help()
+    elif a == "-t":
         test_current_tcping()
         print()
         test_current_curl()
@@ -1118,7 +1125,7 @@ def main():
             num = int(a)
             direct_switch(num)
         except ValueError:
-            print(f"❌ 输入数字序号（从 1 开始）或 -t/-T/-E/-u/-i/-s")
+            print(f"❌ 输入数字序号（从 1 开始）或 -t/-T/-E/-u/-i/-s/-h/--help")
             sys.exit(1)
 
 if __name__ == "__main__":
