@@ -15,6 +15,7 @@
 """
 
 import base64, json, os, platform, re, shutil, socket, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs, unquote
 from pathlib import Path
 
@@ -185,13 +186,9 @@ def node_addr(ob):
 def tcping(host, port, timeout=5):
     """TCP 握手测延迟，不经过代理、不重启 xray"""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
         start = time.time()
-        s.connect((host, int(port)))
-        lat = time.time() - start
-        s.close()
-        return lat
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return time.time() - start
     except Exception:
         return None
 
@@ -758,8 +755,18 @@ def test_current_curl():
         print(f"  #{i+1} {fmt_lat(lat)}")
         time.sleep(0.5)
 
+def tcping_average(node, attempts=3):
+    """返回单个节点多次 TCPing 的平均延迟。"""
+    host, port = node_addr(node)
+    if not host:
+        return None
+    lats = [tcping(host, port) for _ in range(attempts)]
+    valid = [lat for lat in lats if lat is not None]
+    return sum(valid) / len(valid) if valid else None
+
+
 def test_all():
-    """TCPing 所有节点，不需要切换/重启 xray"""
+    """TCPing 所有节点，不需要切换/重启 xray。并发测试避免节点多时线性变慢。"""
     cfg = load_cfg()
     if not cfg:
         print(f"  {RED}❌ 无配置{R}")
@@ -770,24 +777,32 @@ def test_all():
         return {}
     cur = current_tag(cfg)
     latencies = {}
+    rows = []
 
     print(f"  测试 {len(nodes)} 个节点（TCPing）...\n")
-    for i, node in enumerate(nodes):
-        num = i + 1
+
+    max_workers = min(12, len(nodes))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(tcping_average, node): (i + 1, node)
+                      for i, node in enumerate(nodes)}
+        for future in as_completed(future_map):
+            num, node = future_map[future]
+            try:
+                avg = future.result()
+            except Exception:
+                avg = None
+            latencies[num] = avg
+            rows.append((num, node, avg))
+
+    for num, node, avg in sorted(rows, key=lambda item: item[0]):
         tag = node["tag"]
-        host, port = node_addr(node)
+        host, _ = node_addr(node)
         if not host:
-            latencies[num] = None
             print(f"  {B}{num}{R}  {tag}  {RED}❌ 无地址{R}")
             continue
-        lats = [tcping(host, port) for _ in range(3)]
-        valid = [l for l in lats if l is not None]
-        avg = sum(valid) / len(valid) if valid else None
-        latencies[num] = avg
         proto, addr = node_info(node)
         marker = f" {GREEN}👈{R}" if tag == cur else ""
         print(f"  {B}{num}{R}  {tag}  ({proto} {addr})  {fmt_lat(avg)}{marker}")
-        time.sleep(0.2)
 
     best_num = min(latencies, key=lambda k: latencies[k] if latencies[k] is not None else 999)
     if latencies[best_num] is not None and latencies[best_num] < 999:
