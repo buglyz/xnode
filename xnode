@@ -237,13 +237,15 @@ def restart_xray():
         return False
     for _ in range(10):
         try:
-            run(["curl", "-sS", "--socks5-hostname", "127.0.0.1:20170",
-                 "-o", "/dev/null", "--max-time", "3",
-                 f"https://www.google.com/?_={int(time.time()*1000)}"],
-                timeout=5)
-            return True
+            r = run(["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{SOCKS_PORT}",
+                     "-o", "/dev/null", "--max-time", "3",
+                     f"https://www.google.com/?_={int(time.time()*1000)}"],
+                    timeout=5)
+            if r.returncode == 0:
+                return True
         except Exception:
-            time.sleep(0.3)
+            pass
+        time.sleep(0.3)
     return False
 
 def get_sub_url():
@@ -526,33 +528,8 @@ def sync_sub():
     old_cfg = load_cfg()
     old_default = current_tag(old_cfg) if old_cfg else None
 
-    # 按持久化顺序排 outbounds，保证用户默认出站排第一
-    config = generate_config(outbounds)
-
-    # 重新排序 outbounds：默认出站第一，其余按持久化序号
-    order_map = {tag: i for i, tag in enumerate(saved_order)}
-    proxy_outbounds = [o for o in config["outbounds"]
-                       if o["tag"] not in ("direct", "block")]
-    rest = [o for o in config["outbounds"]
-            if o["tag"] in ("direct", "block")]
-
-    # 默认出站放第一位
-    default_node = None
-    sorted_proxies = []
-    if old_default and any(o["tag"] == old_default for o in proxy_outbounds):
-        for o in proxy_outbounds:
-            if o["tag"] == old_default:
-                default_node = o
-            else:
-                sorted_proxies.append(o)
-    else:
-        # 旧默认不在新节点里，取持久化顺序第一个
-        if proxy_outbounds:
-            sorted_proxies = proxy_outbounds[1:]
-            default_node = proxy_outbounds[0]
-
-    config["outbounds"] = ([default_node] + sorted_proxies + rest
-                           if default_node else sorted_proxies + rest)
+    # 按持久化序号重排 outbounds，同时把用户上次选择的默认出站放第一位
+    config = reorder_outbounds(generate_config(outbounds), saved_order, old_default)
 
     # 写入
     tmp = CONFIG + ".sync"
@@ -694,6 +671,29 @@ def generate_config(outbounds):
             ],
         },
     }
+
+
+def reorder_outbounds(config, saved_order, old_default=None):
+    """按持久化序号重排代理出站；旧默认节点仍放第一位。"""
+    proxy_outbounds = [o for o in config["outbounds"]
+                       if o["tag"] not in ("direct", "block")]
+    rest = [o for o in config["outbounds"]
+            if o["tag"] in ("direct", "block")]
+    order_map = {tag: i for i, tag in enumerate(saved_order)}
+    sorted_proxies = sorted(proxy_outbounds,
+                            key=lambda o: order_map.get(o["tag"], len(order_map)))
+
+    default_node = None
+    if old_default:
+        for i, outbound in enumerate(sorted_proxies):
+            if outbound["tag"] == old_default:
+                default_node = sorted_proxies.pop(i)
+                break
+    if default_node is None and sorted_proxies:
+        default_node = sorted_proxies.pop(0)
+
+    config["outbounds"] = ([default_node] if default_node else []) + sorted_proxies + rest
+    return config
 
 # ── 节点切换 ──
 

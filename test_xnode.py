@@ -136,6 +136,90 @@ class XnodeHelperTests(unittest.TestCase):
         self.assertAlmostEqual(latencies[2], 0.1)
         self.assertAlmostEqual(latencies[3], 0.2)
 
+    def test_restart_xray_returns_false_when_readiness_never_succeeds(self):
+        calls = []
+
+        class Result:
+            def __init__(self, returncode):
+                self.returncode = returncode
+                self.stderr = ""
+                self.stdout = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["systemctl", "restart"]:
+                return Result(0)
+            if cmd and cmd[0] == "curl":
+                return Result(28)
+            return Result(0)
+
+        setattr(self.xnode, "run", fake_run)
+        setattr(self.xnode.time, "sleep", lambda seconds: None)
+
+        self.assertFalse(self.xnode.restart_xray())
+        self.assertEqual(sum(1 for cmd in calls if cmd and cmd[0] == "curl"), 10)
+
+    def test_restart_xray_treats_readiness_exceptions_as_failed_attempts(self):
+        class Result:
+            def __init__(self, returncode):
+                self.returncode = returncode
+                self.stderr = ""
+                self.stdout = ""
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["systemctl", "restart"]:
+                return Result(0)
+            if cmd and cmd[0] == "curl":
+                raise TimeoutError("readiness timed out")
+            return Result(0)
+
+        setattr(self.xnode, "run", fake_run)
+        setattr(self.xnode.time, "sleep", lambda seconds: None)
+
+        self.assertFalse(self.xnode.restart_xray())
+
+    def test_restart_xray_returns_true_after_readiness_succeeds(self):
+        curl_attempts = 0
+
+        class Result:
+            def __init__(self, returncode):
+                self.returncode = returncode
+                self.stderr = ""
+                self.stdout = ""
+
+        def fake_run(cmd, **kwargs):
+            nonlocal curl_attempts
+            if cmd[:2] == ["systemctl", "restart"]:
+                return Result(0)
+            if cmd and cmd[0] == "curl":
+                curl_attempts += 1
+                return Result(0 if curl_attempts == 3 else 28)
+            return Result(0)
+
+        setattr(self.xnode, "run", fake_run)
+        setattr(self.xnode.time, "sleep", lambda seconds: None)
+
+        self.assertTrue(self.xnode.restart_xray())
+        self.assertEqual(curl_attempts, 3)
+
+    def test_reorder_outbounds_preserves_old_default_and_stable_order(self):
+        outbounds = [self.outbound(tag) for tag in ["c", "a", "b"]]
+        config = self.xnode.generate_config(outbounds)
+
+        reordered = self.xnode.reorder_outbounds(config, ["b", "a", "c"], "a")
+
+        tags = [outbound["tag"] for outbound in reordered["outbounds"]]
+        self.assertEqual(tags, ["a", "b", "c", "direct", "block"])
+
+    def test_reorder_outbounds_uses_saved_order_when_old_default_missing(self):
+        outbounds = [self.outbound(tag) for tag in ["c", "a", "b"]]
+        config = self.xnode.generate_config(outbounds)
+
+        reordered = self.xnode.reorder_outbounds(config, ["b", "a", "c"], "missing")
+
+        tags = [outbound["tag"] for outbound in reordered["outbounds"]]
+        self.assertEqual(tags, ["b", "a", "c", "direct", "block"])
+
 
 if __name__ == "__main__":
     unittest.main()
