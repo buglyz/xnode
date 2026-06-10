@@ -125,7 +125,7 @@ xnode -s       Show service status
 
 ### TCPing (fast, no xray restart)
 
-Direct TCP handshake to measure node server latency. ~2 seconds for 5 nodes.
+Direct TCP handshake to measure node server latency. Tests run concurrently, so large node lists no longer wait linearly.
 
 - Diagnoses **network layer** issues: is the server reachable, how long is the handshake
 - Does not restart xray, does not disturb current proxy
